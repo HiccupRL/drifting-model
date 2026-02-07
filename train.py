@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+import wandb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -180,6 +181,11 @@ def compute_drifting_loss(
     total_drift_norm = 0.0
     num_losses = 0
 
+    # Metrics storage
+    scale_losses = {}
+    scale_drifts = {}
+    temp_v_norms = {tau: [] for tau in temperatures}
+
     # Compute loss per class
     for c in range(num_classes):
         mask_gen = labels_gen == c
@@ -215,14 +221,25 @@ def compute_drifting_loss(
                 v_norm = torch.sqrt(torch.mean(V_tau ** 2) + 1e-8)
                 V_tau = V_tau / (v_norm + 1e-8)
                 V_total = V_total + V_tau
+                
+                # Track v_norm
+                temp_v_norms[tau].append(v_norm.item())
 
             # Loss: MSE(phi(x), stopgrad(phi(x) + V))
             target = (feat_gen_c_norm + V_total).detach()
             loss_scale = F.mse_loss(feat_gen_c_norm, target)
 
+            drift_norm_val = (V_total ** 2).mean().item() ** 0.5
             total_loss = total_loss + loss_scale
-            total_drift_norm += (V_total ** 2).mean().item() ** 0.5
+            total_drift_norm += drift_norm_val
             num_losses += 1
+
+            # Track scale metrics
+            if scale_idx not in scale_losses:
+                scale_losses[scale_idx] = []
+                scale_drifts[scale_idx] = []
+            scale_losses[scale_idx].append(loss_scale.item())
+            scale_drifts[scale_idx].append(drift_norm_val)
 
     if num_losses == 0:
         return torch.tensor(0.0, device=device, requires_grad=True), {"loss": 0.0, "drift_norm": 0.0}
@@ -232,6 +249,15 @@ def compute_drifting_loss(
         "loss": loss.item(),
         "drift_norm": total_drift_norm / num_losses,
     }
+
+    # Add detailed metrics to info
+    for scale_idx, losses in scale_losses.items():
+        info[f"scale_{scale_idx}/loss"] = sum(losses) / len(losses)
+        info[f"scale_{scale_idx}/drift_norm"] = sum(scale_drifts[scale_idx]) / len(scale_drifts[scale_idx])
+        
+    for tau, norms in temp_v_norms.items():
+        if norms:
+            info[f"temp_{tau}/v_norm"] = sum(norms) / len(norms)
 
     return loss, info
 
@@ -348,6 +374,13 @@ def train(
     # Get config
     config = MNIST_CONFIG.copy() if dataset.lower() == "mnist" else CIFAR10_CONFIG.copy()
     config["dataset"] = dataset
+
+    # Initialize wandb
+    wandb.init(
+        project="drifting-model",
+        config=config,
+        name=f"{dataset}_{config['model']}_{int(time.time())}",
+    )
 
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -489,6 +522,7 @@ def train(
                     f"Grad: {info['grad_norm']:.4f} | "
                     f"LR: {lr:.6f}"
                 )
+                wandb.log({**info, "lr": lr}, step=global_step)
 
             # Generate samples every 500 steps for quick visualization
             if global_step % 500 == 0:
@@ -501,6 +535,7 @@ def train(
                     num_per_class=8,
                 )
                 print(f"Saved samples to {sample_path}")
+                wandb.log({"samples": wandb.Image(str(sample_path), caption=f"Step {global_step}")}, step=global_step)
 
         # Epoch summary
         epoch_time = time.time() - epoch_start
@@ -538,6 +573,7 @@ def train(
                 num_per_class=8,
             )
             print(f"Saved samples to {sample_path}")
+            wandb.log({"epoch_samples": wandb.Image(str(sample_path), caption=f"Epoch {epoch+1}")}, step=global_step)
 
     # Final checkpoint
     final_path = output_dir / "checkpoint_final.pt"
