@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from tqdm import tqdm
 
 from model import DriftDiT_Tiny, DriftDiT_Small, DriftDiT_models
 from drifting import (
@@ -477,7 +478,8 @@ def train(
         # Fill queue at start of each epoch
         fill_queue(queue, train_loader, device, min_samples=64)
 
-        for batch_idx, batch in enumerate(train_loader):
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['epochs']}")
+        for batch_idx, batch in enumerate(pbar):
             if isinstance(batch, (list, tuple)):
                 x_real, labels_real = batch[0].to(device), batch[1].to(device)
             else:
@@ -510,6 +512,13 @@ def train(
             epoch_drift_norm += info["drift_norm"]
             num_batches += 1
             global_step += 1
+            
+            # Update progress bar
+            pbar.set_postfix({
+                "loss": f"{info['loss']:.4f}",
+                "drift": f"{info['drift_norm']:.4f}",
+                "lr": f"{scheduler.get_lr():.6f}"
+            })
 
             # Logging
             if global_step % log_interval == 0:
